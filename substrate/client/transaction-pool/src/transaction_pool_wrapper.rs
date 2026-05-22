@@ -27,8 +27,9 @@ use crate::{
 use async_trait::async_trait;
 use sc_transaction_pool_api::{
 	ChainEvent, ImportNotificationStream, LocalTransactionFor, LocalTransactionPool,
-	MaintainedTransactionPool, PoolStatus, ReadyTransactions, TransactionFor, TransactionPool,
-	TransactionSource, TransactionStatusStreamFor, TxHash, TxInvalidityReportMap,
+	MaintainedTransactionPool, PoolLifecycleEventStream, PoolStatus, ReadyTransactions,
+	TransactionFor, TransactionPool, TransactionSource, TransactionStatusStreamFor, TxHash,
+	TxInvalidityReportMap,
 };
 use sp_runtime::traits::Block as BlockT;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
@@ -125,6 +126,12 @@ where
 
 	fn import_notification_stream(&self) -> ImportNotificationStream<TxHash<Self>> {
 		self.0.import_notification_stream()
+	}
+
+	fn pool_lifecycle_event_stream(
+		&self,
+	) -> PoolLifecycleEventStream<TxHash<Self>, <Self::Block as BlockT>::Hash> {
+		self.0.pool_lifecycle_event_stream()
 	}
 
 	fn on_broadcasted(&self, propagations: HashMap<TxHash<Self>, Vec<String>>) {

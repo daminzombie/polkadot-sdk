@@ -25,7 +25,10 @@ use crate::{
 use futures::channel::mpsc::{channel, Sender};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
-use sc_transaction_pool_api::{error, PoolStatus, ReadyTransactions, TransactionPriority};
+use sc_transaction_pool_api::{
+	error, PoolLifecycleEvent, PoolLifecycleEventStream, PoolStatus, PoolTransactionEvent,
+	ReadyTransactions, TransactionPriority,
+};
 use sp_blockchain::HashAndNumber;
 use sp_runtime::{
 	traits::SaturatedConversion,
@@ -168,6 +171,7 @@ pub struct ValidatedPool<B: ChainApi, L: EventHandler<B>> {
 	event_dispatcher: RwLock<EventDispatcher<B, L>>,
 	pub(crate) pool: RwLock<base::BasePool<ExtrinsicHash<B>, ExtrinsicFor<B>>>,
 	import_notification_sinks: Mutex<Vec<Sender<ExtrinsicHash<B>>>>,
+	lifecycle_event_sinks: Mutex<Vec<Sender<PoolLifecycleEvent<ExtrinsicHash<B>, BlockHash<B>>>>>,
 	rotator: PoolRotator<ExtrinsicHash<B>>,
 	enforce_limits_stats: SyncDurationSlidingStats,
 }
@@ -181,6 +185,7 @@ impl<B: ChainApi, L: EventHandler<B>> Clone for ValidatedPool<B, L> {
 			event_dispatcher: Default::default(),
 			pool: RwLock::from(self.pool.read().clone()),
 			import_notification_sinks: Default::default(),
+			lifecycle_event_sinks: Default::default(),
 			rotator: self.rotator.clone(),
 			enforce_limits_stats: self.enforce_limits_stats.clone(),
 		}
@@ -253,6 +258,7 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			api,
 			pool: RwLock::new(base_pool),
 			import_notification_sinks: Default::default(),
+			lifecycle_event_sinks: Default::default(),
 			rotator,
 			enforce_limits_stats: SyncDurationSlidingStats::new(Duration::from_secs(
 				STAT_SLIDING_WINDOW,
@@ -318,8 +324,9 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 		results
 			.into_iter()
 			.map(|res| match res {
-				Ok(outcome) if removed.contains(&outcome.hash) =>
-					Err(error::Error::ImmediatelyDropped.into()),
+				Ok(outcome) if removed.contains(&outcome.hash) => {
+					Err(error::Error::ImmediatelyDropped.into())
+				},
 				other => other,
 			})
 			.collect()
@@ -339,7 +346,7 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 					"ValidatedPool::submit_one"
 				);
 				if !tx.propagate && !(self.is_validator.0)() {
-					return Err(error::Error::Unactionable.into())
+					return Err(error::Error::Unactionable.into());
 				}
 
 				let imported = self.pool.write().import(tx)?;
@@ -348,7 +355,7 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 					let sinks = &mut self.import_notification_sinks.lock();
 					sinks.retain_mut(|sink| match sink.try_send(*hash) {
 						Ok(()) => true,
-						Err(e) =>
+						Err(e) => {
 							if e.is_full() {
 								warn!(
 									target: LOG_TARGET,
@@ -358,10 +365,12 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 								true
 							} else {
 								false
-							},
+							}
+						},
 					});
 				}
 
+				self.fire_lifecycle_events(&imported);
 				let mut event_dispatcher = self.event_dispatcher.write();
 				fire_events(&mut *event_dispatcher, &imported);
 				Ok(ValidatedPoolSubmitOutcome::new(*imported.hash(), Some(priority)))
@@ -394,8 +403,8 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 		let ready_limit = &self.options.ready;
 		let future_limit = &self.options.future;
 
-		if ready_limit.is_exceeded(status.ready, status.ready_bytes) ||
-			future_limit.is_exceeded(status.future, status.future_bytes)
+		if ready_limit.is_exceeded(status.ready, status.ready_bytes)
+			|| future_limit.is_exceeded(status.future, status.future_bytes)
 		{
 			trace!(
 				target: LOG_TARGET,
@@ -430,6 +439,9 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			let mut event_dispatcher = self.event_dispatcher.write();
 			for h in &removed {
 				event_dispatcher.limits_enforced(h);
+			}
+			for h in &removed {
+				self.notify_lifecycle_transaction(*h, PoolTransactionEvent::LimitEnforced);
 			}
 
 			removed
@@ -575,8 +587,8 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 								final_statuses.insert(tx_hash, Status::Failed);
 							},
 						},
-						ValidatedTransaction::Invalid(_, _) |
-						ValidatedTransaction::Unknown(_, _) => {
+						ValidatedTransaction::Invalid(_, _)
+						| ValidatedTransaction::Unknown(_, _) => {
 							final_statuses.insert(tx_hash, Status::Failed);
 						},
 					}
@@ -600,10 +612,22 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			let initial_status = initial_statuses.remove(&hash);
 			if initial_status.is_none() || Some(final_status) != initial_status {
 				match final_status {
-					Status::Future => event_dispatcher.future(&hash),
-					Status::Ready => event_dispatcher.ready(&hash, None),
-					Status::Dropped => event_dispatcher.dropped(&hash),
-					Status::Failed => event_dispatcher.invalid(&hash),
+					Status::Future => {
+						event_dispatcher.future(&hash);
+						self.notify_lifecycle_transaction(hash, PoolTransactionEvent::Future);
+					},
+					Status::Ready => {
+						event_dispatcher.ready(&hash, None);
+						self.notify_lifecycle_transaction(hash, PoolTransactionEvent::Ready);
+					},
+					Status::Dropped => {
+						event_dispatcher.dropped(&hash);
+						self.notify_lifecycle_transaction(hash, PoolTransactionEvent::Dropped);
+					},
+					Status::Failed => {
+						event_dispatcher.invalid(&hash);
+						self.notify_lifecycle_transaction(hash, PoolTransactionEvent::Invalid);
+					},
 				}
 			}
 		}
@@ -643,6 +667,12 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			for f in &status.failed {
 				event_dispatcher.dropped(f);
 			}
+		}
+		for promoted in &status.promoted {
+			self.fire_lifecycle_events(promoted);
+		}
+		for f in &status.failed {
+			self.notify_lifecycle_transaction(*f, PoolTransactionEvent::Dropped);
 		}
 
 		status
@@ -692,6 +722,10 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			// we'd like to send out the `InBlock` notification only once.
 			if !set.contains(&h) {
 				event_dispatcher.pruned(at.hash, &h);
+				self.notify_lifecycle_transaction(
+					h,
+					PoolTransactionEvent::Pruned { block_hash: at.hash, tx_index: set.len() },
+				);
 				set.insert(h);
 			}
 		}
@@ -752,10 +786,25 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 		stream
 	}
 
+	/// Return an event stream of detailed transaction pool lifecycle events.
+	pub fn pool_lifecycle_event_stream(
+		&self,
+	) -> PoolLifecycleEventStream<ExtrinsicHash<B>, BlockHash<B>> {
+		const CHANNEL_BUFFER_SIZE: usize = 4096;
+
+		let (sink, stream) = channel(CHANNEL_BUFFER_SIZE);
+		self.lifecycle_event_sinks.lock().push(sink);
+		stream
+	}
+
 	/// Invoked when extrinsics are broadcasted.
 	pub fn on_broadcasted(&self, propagated: HashMap<ExtrinsicHash<B>, Vec<String>>) {
 		let mut event_dispatcher = self.event_dispatcher.write();
 		for (hash, peers) in propagated.into_iter() {
+			self.notify_lifecycle_transaction(
+				hash,
+				PoolTransactionEvent::Broadcasted { peers: peers.clone() },
+			);
 			event_dispatcher.broadcasted(&hash, peers);
 		}
 	}
@@ -774,12 +823,15 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 	pub fn remove_invalid(&self, hashes: &[ExtrinsicHash<B>]) -> Vec<TransactionFor<B>> {
 		// early exit in case there is no invalid transactions.
 		if hashes.is_empty() {
-			return vec![]
+			return vec![];
 		}
 
 		let invalid = self.remove_subtree(hashes, true, |listener, removed_tx_hash| {
 			listener.invalid(&removed_tx_hash);
 		});
+		for tx in &invalid {
+			self.notify_lifecycle_transaction(tx.hash, PoolTransactionEvent::Invalid);
+		}
 
 		trace!(
 			target: LOG_TARGET,
@@ -814,13 +866,25 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			?block_hash,
 			"Attempting to notify watchers of finalization"
 		);
-		self.event_dispatcher.write().finalized(block_hash);
+		let finalized = self.event_dispatcher.write().finalized(block_hash);
+		for (tx_hash, tx_index) in finalized {
+			self.notify_lifecycle_transaction(
+				tx_hash,
+				PoolTransactionEvent::Finalized { block_hash, tx_index },
+			);
+		}
 		Ok(())
 	}
 
 	/// Notify the event_dispatcher of retracted blocks
 	pub fn on_block_retracted(&self, block_hash: BlockHash<B>) {
-		self.event_dispatcher.write().retracted(block_hash)
+		let retracted = self.event_dispatcher.write().retracted(block_hash);
+		for tx_hash in retracted {
+			self.notify_lifecycle_transaction(
+				tx_hash,
+				PoolTransactionEvent::Retracted { block_hash },
+			);
+		}
 	}
 
 	/// Resends ready and future events for all the ready and future transactions that are already
@@ -832,9 +896,11 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 		let mut event_dispatcher = self.event_dispatcher.write();
 		pool.ready().for_each(|r| {
 			event_dispatcher.ready(&r.hash, None);
+			self.notify_lifecycle_transaction(r.hash, PoolTransactionEvent::Ready);
 		});
 		pool.futures().for_each(|f| {
 			event_dispatcher.future(&f.hash);
+			self.notify_lifecycle_transaction(f.hash, PoolTransactionEvent::Future);
 		});
 	}
 
@@ -876,6 +942,60 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 				tx.clone()
 			})
 			.collect::<Vec<_>>()
+	}
+
+	fn notify_lifecycle_transaction(
+		&self,
+		hash: ExtrinsicHash<B>,
+		event: PoolTransactionEvent<ExtrinsicHash<B>, BlockHash<B>>,
+	) {
+		self.notify_lifecycle(PoolLifecycleEvent::Transaction { hash, event });
+	}
+
+	pub(crate) fn notify_lifecycle(
+		&self,
+		event: PoolLifecycleEvent<ExtrinsicHash<B>, BlockHash<B>>,
+	) {
+		let sinks = &mut self.lifecycle_event_sinks.lock();
+		sinks.retain_mut(|sink| match sink.try_send(event.clone()) {
+			Ok(()) => true,
+			Err(error) => {
+				if error.is_full() {
+					warn!(
+						target: LOG_TARGET,
+						"Trying to notify a pool lifecycle event but the channel is full"
+					);
+					true
+				} else {
+					false
+				}
+			},
+		});
+	}
+
+	fn fire_lifecycle_events(&self, imported: &base::Imported<ExtrinsicHash<B>, ExtrinsicFor<B>>) {
+		match imported {
+			base::Imported::Ready { promoted, failed, removed, hash } => {
+				self.notify_lifecycle_transaction(*hash, PoolTransactionEvent::ImportedReady);
+				self.notify_lifecycle_transaction(*hash, PoolTransactionEvent::Ready);
+				for failed in failed {
+					self.notify_lifecycle_transaction(*failed, PoolTransactionEvent::Invalid);
+				}
+				for removed in removed {
+					self.notify_lifecycle_transaction(
+						removed.hash,
+						PoolTransactionEvent::Usurped { by: *hash },
+					);
+				}
+				for promoted in promoted {
+					self.notify_lifecycle_transaction(*promoted, PoolTransactionEvent::Ready);
+				}
+			},
+			base::Imported::Future { hash } => {
+				self.notify_lifecycle_transaction(*hash, PoolTransactionEvent::ImportedFuture);
+				self.notify_lifecycle_transaction(*hash, PoolTransactionEvent::Future);
+			},
+		}
 	}
 }
 

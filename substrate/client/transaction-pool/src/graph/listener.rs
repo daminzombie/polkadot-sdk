@@ -244,17 +244,21 @@ impl<C: ChainApi, L: EventHandler<C>> EventDispatcher<ExtrinsicHash<C>, C, L> {
 	}
 
 	/// The block this transaction was included in has been retracted.
-	pub fn retracted(&mut self, block_hash: BlockHash<C>) {
+	pub fn retracted(&mut self, block_hash: BlockHash<C>) -> Vec<ExtrinsicHash<C>> {
+		let mut retracted = Vec::new();
 		if let Some(hashes) = self.finality_watchers.remove(&block_hash) {
 			for hash in hashes {
 				self.fire(&hash, |watcher| watcher.retracted(block_hash));
 				self.event_handler.as_ref().map(|l| l.retracted(hash, block_hash));
+				retracted.push(hash);
 			}
 		}
+		retracted
 	}
 
 	/// Notify all watchers that transactions have been finalized
-	pub fn finalized(&mut self, block_hash: BlockHash<C>) {
+	pub fn finalized(&mut self, block_hash: BlockHash<C>) -> Vec<(ExtrinsicHash<C>, usize)> {
+		let mut finalized = Vec::new();
 		if let Some(hashes) = self.finality_watchers.remove(&block_hash) {
 			for (tx_index, tx_hash) in hashes.into_iter().enumerate() {
 				trace!(
@@ -265,8 +269,10 @@ impl<C: ChainApi, L: EventHandler<C>> EventDispatcher<ExtrinsicHash<C>, C, L> {
 				);
 				self.fire(&tx_hash, |watcher| watcher.finalized(block_hash, tx_index));
 				self.event_handler.as_ref().map(|l| l.finalized(tx_hash, block_hash, tx_index));
+				finalized.push((tx_hash, tx_index));
 			}
 		}
+		finalized
 	}
 
 	/// Provides hashes of all watched transactions.

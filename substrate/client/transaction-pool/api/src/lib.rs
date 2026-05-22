@@ -162,11 +162,11 @@ impl<Hash, BlockHash> TransactionStatus<Hash, BlockHash> {
 	pub fn is_final(&self) -> bool {
 		// The state must be kept in sync with `crate::graph::Sender`.
 		match self {
-			Self::Usurped(_) |
-			Self::Finalized(_) |
-			Self::FinalityTimeout(_) |
-			Self::Invalid |
-			Self::Dropped => true,
+			Self::Usurped(_)
+			| Self::Finalized(_)
+			| Self::FinalityTimeout(_)
+			| Self::Invalid
+			| Self::Dropped => true,
 			_ => false,
 		}
 	}
@@ -195,6 +195,109 @@ pub type TransactionStatusStream<Hash, BlockHash> =
 
 /// The import notification event stream.
 pub type ImportNotificationStream<H> = futures::channel::mpsc::Receiver<H>;
+
+/// The transaction pool lifecycle event stream.
+pub type PoolLifecycleEventStream<H, BH> =
+	futures::channel::mpsc::Receiver<PoolLifecycleEvent<H, BH>>;
+
+/// Lifecycle events emitted by the transaction pool for observability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PoolLifecycleEvent<Hash, BlockHash> {
+	/// Transaction-specific lifecycle transition.
+	Transaction {
+		/// Transaction hash.
+		hash: Hash,
+		/// Transaction event.
+		event: PoolTransactionEvent<Hash, BlockHash>,
+	},
+	/// Pool maintenance lifecycle transition.
+	Maintenance {
+		/// Maintenance event.
+		event: PoolMaintenanceEvent<BlockHash>,
+	},
+}
+
+/// Transaction lifecycle events emitted by the transaction pool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PoolTransactionEvent<Hash, BlockHash> {
+	/// Transaction was imported into the ready queue.
+	ImportedReady,
+	/// Transaction was imported into the future queue.
+	ImportedFuture,
+	/// Transaction became ready.
+	Ready,
+	/// Transaction moved to or remained in future.
+	Future,
+	/// Transaction was invalid.
+	Invalid,
+	/// Transaction was dropped.
+	Dropped,
+	/// Transaction was dropped because pool limits were enforced.
+	LimitEnforced,
+	/// Transaction was replaced by another transaction.
+	Usurped {
+		/// Replacing transaction hash.
+		by: Hash,
+	},
+	/// Transaction was broadcasted to peers.
+	Broadcasted {
+		/// Peer identifiers.
+		peers: Vec<String>,
+	},
+	/// Transaction was included in an imported block and pruned from the pool.
+	Pruned {
+		/// Block hash.
+		block_hash: BlockHash,
+		/// Transaction index in block.
+		tx_index: usize,
+	},
+	/// Transaction inclusion block was retracted.
+	Retracted {
+		/// Retracted block hash.
+		block_hash: BlockHash,
+	},
+	/// Transaction finality watcher timed out.
+	FinalityTimeout {
+		/// Timed out block hash.
+		block_hash: BlockHash,
+	},
+	/// Transaction was finalized.
+	Finalized {
+		/// Finalized block hash.
+		block_hash: BlockHash,
+		/// Transaction index in block.
+		tx_index: usize,
+	},
+}
+
+/// Transaction pool maintenance events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PoolMaintenanceEvent<BlockHash> {
+	/// Maintenance started for a chain event.
+	Started {
+		/// Chain event block hash.
+		block_hash: BlockHash,
+		/// Whether the chain event is finalization.
+		is_finalized: bool,
+	},
+	/// Maintenance finished for a chain event.
+	Finished {
+		/// Chain event block hash.
+		block_hash: BlockHash,
+		/// Whether the chain event is finalization.
+		is_finalized: bool,
+	},
+	/// Maintenance was skipped by enactment state.
+	Skipped {
+		/// Chain event block hash.
+		block_hash: BlockHash,
+		/// Whether the chain event is finalization.
+		is_finalized: bool,
+	},
+}
 
 /// Transaction hash type for a pool.
 pub type TxHash<P> = <P as TransactionPool>::Hash;
@@ -327,6 +430,14 @@ pub trait TransactionPool: Send + Sync {
 	// *** logging / RPC / networking
 	/// Return an event stream of transactions imported to the pool.
 	fn import_notification_stream(&self) -> ImportNotificationStream<TxHash<Self>>;
+
+	/// Return an event stream of detailed transaction pool lifecycle events.
+	fn pool_lifecycle_event_stream(
+		&self,
+	) -> PoolLifecycleEventStream<TxHash<Self>, BlockHash<Self>> {
+		let (_sink, stream) = futures::channel::mpsc::channel(1);
+		stream
+	}
 
 	// *** networking
 	/// Notify the pool about transactions broadcast.
@@ -526,7 +637,7 @@ impl<Block: BlockT> sp_core::offchain::TransactionPool for OffchainTransactionPo
 					"Failed to decode extrinsic in `OffchainTransactionPool::submit_transaction`: {e:?}"
 				);
 
-				return Err(())
+				return Err(());
 			},
 		};
 
