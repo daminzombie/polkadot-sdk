@@ -331,6 +331,10 @@ pub trait InPoolTransaction {
 	fn hash(&self) -> &Self::Hash;
 	/// Get priority of the transaction.
 	fn priority(&self) -> &TransactionPriority;
+	/// Get internal pool insertion id, when available.
+	fn insertion_id(&self) -> Option<u64> {
+		None
+	}
 	/// Get longevity of the transaction.
 	fn longevity(&self) -> &TransactionLongevity;
 	/// Get transaction dependencies.

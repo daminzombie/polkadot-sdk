@@ -80,6 +80,7 @@ impl<Hash, Ex, Error> ValidatedTransaction<Hash, Ex, Error> {
 			hash,
 			source,
 			priority: validity.priority,
+			insertion_id: Default::default(),
 			requires: validity.requires,
 			provides: validity.provides,
 			propagate: validity.propagate,
@@ -961,9 +962,9 @@ impl<B: ChainApi, L: EventHandler<B>> ValidatedPool<B, L> {
 			Ok(()) => true,
 			Err(error) => {
 				if error.is_full() {
-					warn!(
+					trace!(
 						target: LOG_TARGET,
-						"Trying to notify a pool lifecycle event but the channel is full"
+						"Skipping pool lifecycle event because observer channel is full"
 					);
 					true
 				} else {

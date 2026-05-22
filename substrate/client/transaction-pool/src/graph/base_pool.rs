@@ -20,7 +20,16 @@
 //!
 //! For a more full-featured pool, have a look at the `pool` module.
 
-use std::{cmp::Ordering, collections::HashSet, fmt, hash, sync::Arc, time::Instant};
+use std::{
+	cmp::Ordering,
+	collections::HashSet,
+	fmt, hash,
+	sync::{
+		atomic::{AtomicU64, Ordering as AtomicOrdering},
+		Arc,
+	},
+	time::Instant,
+};
 
 use crate::LOG_TARGET;
 use sc_transaction_pool_api::{error, InPoolTransaction, PoolStatus};
@@ -122,7 +131,7 @@ impl TimedTransactionSource {
 }
 
 /// Immutable transaction
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Clone)]
 pub struct Transaction<Hash, Extrinsic> {
 	/// Raw extrinsic representing that transaction.
 	pub data: Extrinsic,
@@ -132,6 +141,8 @@ pub struct Transaction<Hash, Extrinsic> {
 	pub hash: Hash,
 	/// Transaction priority (higher = better)
 	pub priority: Priority,
+	/// Unique id assigned when the transaction enters the ready queue.
+	pub insertion_id: Arc<AtomicU64>,
 	/// At which block the transaction becomes invalid?
 	pub valid_till: Longevity,
 	/// Tags required by the transaction.
@@ -143,6 +154,23 @@ pub struct Transaction<Hash, Extrinsic> {
 	/// Timed source of that transaction.
 	pub source: TimedTransactionSource,
 }
+
+impl<Hash: PartialEq, Extrinsic: PartialEq> PartialEq for Transaction<Hash, Extrinsic> {
+	fn eq(&self, other: &Self) -> bool {
+		self.data == other.data
+			&& self.bytes == other.bytes
+			&& self.hash == other.hash
+			&& self.priority == other.priority
+			&& self.insertion_id() == other.insertion_id()
+			&& self.valid_till == other.valid_till
+			&& self.requires == other.requires
+			&& self.provides == other.provides
+			&& self.propagate == other.propagate
+			&& self.source == other.source
+	}
+}
+
+impl<Hash: Eq, Extrinsic: Eq> Eq for Transaction<Hash, Extrinsic> {}
 
 impl<Hash, Extrinsic> AsRef<Extrinsic> for Transaction<Hash, Extrinsic> {
 	fn as_ref(&self) -> &Extrinsic {
@@ -164,6 +192,13 @@ impl<Hash, Extrinsic> InPoolTransaction for Transaction<Hash, Extrinsic> {
 
 	fn priority(&self) -> &Priority {
 		&self.priority
+	}
+
+	fn insertion_id(&self) -> Option<u64> {
+		match self.insertion_id.load(AtomicOrdering::Relaxed) {
+			0 => None,
+			id => Some(id),
+		}
 	}
 
 	fn longevity(&self) -> &Longevity {
@@ -195,6 +230,7 @@ impl<Hash: Clone, Extrinsic: Clone> Transaction<Hash, Extrinsic> {
 			bytes: self.bytes,
 			hash: self.hash.clone(),
 			priority: self.priority,
+			insertion_id: Arc::new(AtomicU64::new(self.insertion_id.load(AtomicOrdering::Relaxed))),
 			source: self.source.clone(),
 			valid_till: self.valid_till,
 			requires: self.requires.clone(),
@@ -220,6 +256,7 @@ where
 		write!(fmt, "Transaction {{ ")?;
 		write!(fmt, "hash: {:?}, ", &self.hash)?;
 		write!(fmt, "priority: {:?}, ", &self.priority)?;
+		write!(fmt, "insertion_id: {:?}, ", self.insertion_id())?;
 		write!(fmt, "valid_till: {:?}, ", &self.valid_till)?;
 		write!(fmt, "bytes: {:?}, ", &self.bytes)?;
 		write!(fmt, "propagate: {:?}, ", &self.propagate)?;

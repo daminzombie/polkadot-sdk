@@ -194,6 +194,9 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 		let insertion_id = self.insertion_id;
 		let hash = tx.transaction.hash.clone();
 		let transaction = tx.transaction;
+		transaction
+			.insertion_id
+			.store(insertion_id, std::sync::atomic::Ordering::Relaxed);
 
 		let (replaced, unlocks) = self.replace_previous(&transaction)?;
 
